@@ -2,8 +2,9 @@ name: Create überjar and native installers
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+    tags: ['v*']
+  workflow_dispatch:
 
 env:
   blt_name: Beat Link Trigger
@@ -83,57 +84,6 @@ jobs:
       run: bash .github/scripts/create_release.sh
 
 
-  build_online_guide:
-    name: Build and publish user guide
-    runs-on: ubuntu-latest
-
-    needs:
-      build_uberjar
-
-    steps:
-      - name: Check out main branch
-        uses: actions/checkout@v4
-
-      - name: Determine version being built
-        uses: Deep-Symmetry/github-version-action@v1
-        with:
-          tag-var-name: release_tag
-
-      - name: Determine snapshot status
-        run: |
-          if [[ $release_tag =~ .*-SNAPSHOT ]]
-          then
-            echo "release_snapshot=true" >> $GITHUB_ENV
-          else
-            echo "release_snapshot=false" >> $GITHUB_ENV
-          fi
-
-      - name: Install SSH Key
-        env:
-          found_ssh_key: ${{ secrets.GUIDE_SSH_KEY }}
-        if: ${{ env.found_ssh_key != '' }}
-        uses: shimataro/ssh-key-action@v2
-        with:
-          key: ${{ secrets.GUIDE_SSH_KEY }}
-          known_hosts: 'deepsymmetry.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINfnL8k99MCOHLciHb7czxFCCvF3lbmY2ase2VhdvCTN'
-
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2.1'
-
-      - name: Cache htmltest results
-        uses: actions/cache@v4
-        with:
-          path: tmp/.htmltest
-          key: ${{ runner.os }}-htmltest
-
-      - name: Build and publish user guide
-        env:
-          GUIDE_SSH_KEY: ${{ secrets.GUIDE_SSH_KEY }}
-        run: bash .github/scripts/build_guide.sh
-
-
   build_msi:
     name: Build Windows native installer
     runs-on: windows-latest
@@ -172,107 +122,11 @@ jobs:
     - name: Build Windows Installer
       run: .\.github\scripts\build_msi.ps1
 
-  build_dmg:
-    name: Build macOS Apple Silicon Disk Image
-    runs-on: macos-latest
-
-    needs:
-      build_uberjar
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - uses: Deep-Symmetry/github-version-action@v1
-      with:
-        tag-var-name: release_tag
-
-    - name: Determine überjar name, build version, disk image name, artifact name, and snapshot status
-      run: |
-        uberjarName="beat-link-trigger-$git_version.jar"
-        echo "uberjar_name=$uberjarName" >>$GITHUB_ENV
-        buildVersion=${release_tag%-SNAPSHOT}
-        buildVersion=${buildVersion#v}
-        echo "build_version=$buildVersion" >>$GITHUB_ENV
-        dmgName="Beat Link Trigger-$buildVersion.dmg"
-        echo "dmg_name=$dmgName" >>$GITHUB_ENV
-        artifactName="Beat-Link-Trigger-$git_version-MacOS.dmg"
-        echo "artifact_name=$artifactName" >>$GITHUB_ENV
-        artifactDescription="macOS (Apple Silicon) disk image"
-        echo "artifact_description=$artifactDescription" >>$GITHUB_ENV
-        if [[ $release_tag =~ .*-SNAPSHOT ]]
-        then
-          echo "release_snapshot=true" >>$GITHUB_ENV
-        else
-          echo "release_snapshot=false" >>$GITHUB_ENV
-        fi
-
-    - uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'corretto'
-
-    - name: Build macOS disk image
-      env:
-        IDENTITY_PASSPHRASE: ${{ secrets.IDENTITY_PASSPHRASE }}
-        IDENTITY_P12_B64: ${{ secrets.IDENTITY_P12_B64 }}
-        NOTARIZATION_PW: ${{ secrets.NOTARIZATION_PW }}
-      run: zsh .github/scripts/build_dmg.zsh
-
-  build_intel_dmg:
-    name: Build macOS Intel Disk Image
-    runs-on: macos-13
-
-    needs:
-      build_uberjar
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - uses: Deep-Symmetry/github-version-action@v1
-      with:
-        tag-var-name: release_tag
-
-    - name: Determine überjar name, build version, disk image name, artifact name, and snapshot status
-      run: |
-        uberjarName="beat-link-trigger-$git_version.jar"
-        echo "uberjar_name=$uberjarName" >>$GITHUB_ENV
-        buildVersion=${release_tag%-SNAPSHOT}
-        buildVersion=${buildVersion#v}
-        echo "build_version=$buildVersion" >>$GITHUB_ENV
-        dmgName="Beat Link Trigger-$buildVersion.dmg"
-        echo "dmg_name=$dmgName" >>$GITHUB_ENV
-        artifactName="Beat-Link-Trigger-$git_version-MacOS-Intel.dmg"
-        echo "artifact_name=$artifactName" >>$GITHUB_ENV
-        artifactDescription="macOS (Intel) disk image"
-        echo "artifact_description=$artifactDescription" >>$GITHUB_ENV
-
-        if [[ $release_tag =~ .*-SNAPSHOT ]]
-        then
-          echo "release_snapshot=true" >>$GITHUB_ENV
-        else
-          echo "release_snapshot=false" >>$GITHUB_ENV
-        fi
-
-    - uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'corretto'
-
-    - name: Build macOS disk image
-      env:
-        IDENTITY_PASSPHRASE: ${{ secrets.IDENTITY_PASSPHRASE }}
-        IDENTITY_P12_B64: ${{ secrets.IDENTITY_P12_B64 }}
-        NOTARIZATION_PW: ${{ secrets.NOTARIZATION_PW }}
-      run: zsh .github/scripts/build_dmg.zsh
-
   finish_release:
     name: Finish the release
     runs-on: ubuntu-latest
 
     needs:
-      - build_dmg
-      - build_online_guide
-      - build_intel_dmg
       - build_msi
 
     steps:
