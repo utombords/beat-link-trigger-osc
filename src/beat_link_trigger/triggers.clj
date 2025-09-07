@@ -24,7 +24,7 @@
             [clojure.string]
             [fipp.edn :as fipp]
             [inspector-jay.core :as inspector]
-            [overtone.midi :as midi]
+            [overtone.osc :as osc]
             [seesaw.bind :as bind]
             [seesaw.chooser :as chooser]
             [seesaw.core :as seesaw]
@@ -39,10 +39,7 @@
             DeviceAnnouncementListener DeviceFinder DeviceUpdateListener LifecycleListener
             Util VirtualCdj]
            [org.deepsymmetry.beatlink.data AnalysisTagFinder ArtFinder BeatGridFinder CrateDigger MetadataFinder
-            SearchableItem SignatureFinder TimeFinder TrackMetadata WaveformFinder]
-           [beat_link_trigger.util MidiChoice]
-           [org.deepsymmetry.electro Metronome]
-           [uk.co.xfactorylibrarians.coremidi4j CoreMidiDeviceProvider]))
+            SearchableItem SignatureFinder TimeFinder TrackMetadata WaveformFinder]))
 
 ;; This used to be where this was defined, but for compilation order reasons, and then also for
 ;; better isolation of user code, it has been swapped into the expressions namespace.
@@ -238,231 +235,29 @@
   (for [i (range -1 5)]
     (PlayerChoice. i)))
 
-(defn get-chosen-output
-  "Return the MIDI output to which messages should be sent for a given
-  trigger, opening it if this is the first time we are using it, or
-  reusing it if we already opened it. Returns `nil` if the output can
-  not currently be found (it was disconnected, or present in a loaded
-  file but not on this system). When available, `data` contains the
-  map retrieved from the trigger `user-data` atom so it does not need
-  to be reloaded."
-  ([trigger]
-   (get-chosen-output trigger @(seesaw/user-data trigger)))
-  ([_ data]
-   (when-let [^MidiChoice selection (get-in data [:value :outputs])]
-     (let [device-name (.full_name selection)]
-       (or (get @util/opened-outputs device-name)
-           (try
-             (let [new-output (midi/midi-out (str "^" (java.util.regex.Pattern/quote device-name) "$"))]
-               (swap! util/opened-outputs assoc device-name new-output)
-               new-output)
-             (catch IllegalArgumentException e  ; The chosen output is not currently available
-               (timbre/debug e "Trigger using nonexisting MIDI output" device-name))
-             (catch Exception e  ; Some other problem opening the device
-               (timbre/error e "Problem opening device" device-name "(treating as unavailable)"))))))))
 
-(defn no-output-chosen
-  "Returns truthy if the MIDI output menu for a trigger is empty, which
-  will probably only happen if there are no MIDI outputs available on
-  the host system, but we still want to allow non-MIDI expressions to
-  operate."
-  ([trigger]
-   (no-output-chosen trigger @(seesaw/user-data trigger)))
-  ([_ data]
-   (not (get-in data [:value :outputs]))))
-
-(def ^:private clock-message
-  "A MIDI timing clock message that can be sent by any trigger that is
-  sending clock pulses."
-  (javax.sound.midi.ShortMessage. javax.sound.midi.ShortMessage/TIMING_CLOCK))
-
-(def ^:private start-message
-  "A MIDI clock start message that can be sent by any trigger that is
-  sending clock pulses."
-  (javax.sound.midi.ShortMessage. javax.sound.midi.ShortMessage/START))
-
-(def ^:private stop-message
-  "A MIDI clock stop message that can be sent by any trigger that is
-  sending clock pulses."
-  (javax.sound.midi.ShortMessage. javax.sound.midi.ShortMessage/STOP))
-
-(def ^:private continue-message
-  "A MIDI clock continue message that can be sent by any trigger that
-  is sending clock pulses."
-  (javax.sound.midi.ShortMessage. javax.sound.midi.ShortMessage/CONTINUE))
-
-(defn- clock-sender
-  "The loop which sends MIDI clock messages to synchronize a MIDI device
-  with the tempo received from beat-link, as long as the trigger is
-  enabled and our `running` atom holds a `true` value."
-  [trigger ^Metronome metro running]
-  (try
-    (timbre/info "Midi clock thread starting for Trigger"
-                 (:index (seesaw/value trigger)))
-    (let [last-beat-sent (atom nil)]
-      (loop []
-        (let [trigger-data  @(seesaw/user-data trigger)
-              output        (get-chosen-output trigger trigger-data)
-              snapshot      (.getSnapshot metro)
-              beat          (.getBeat snapshot)
-              next-beat-due (.getTimeOfBeat snapshot (inc beat))
-              sleep-ms      (- next-beat-due (System/currentTimeMillis))]
-          (when (and (some? output) (not= beat @last-beat-sent))
-            ;; Send a clock pulse if we are on a new beat as long as our MIDI output is present.
-            (midi/midi-send-msg (:receiver output) clock-message -1)
-            (reset! last-beat-sent beat))
-
-          (if (> sleep-ms 5)  ; Long enough to actually try sleeping until we are closer to due.
-            (try
-              (Thread/sleep (- sleep-ms 5))
-              (catch InterruptedException _))
-            (loop [target-time (+ (System/nanoTime)
-                                  (.toNanos java.util.concurrent.TimeUnit/MILLISECONDS sleep-ms))]
-              (when (and (not (Thread/interrupted))
-                         (< (System/nanoTime) target-time))
-                (recur target-time))))  ; Busy-waiting, woo hoo, hope you didn't need this core!
-
-          (when (and @running (= "Clock" (:message (:value trigger-data))) (enabled? trigger trigger-data))
-            (recur)))))  ;; We are still running, enabled, and set to send clock messages, so continue the loop.
-    (catch Throwable t
-      (timbre/error t "Problem running MIDI clock loop, exiting, for Trigger"
-                    (:index (seesaw/value trigger)))))
-  (timbre/info "Midi Clock thread ending for Trigger"
-               (:index (seesaw/value trigger))))
-
-(defn- clock-tempo
-  "Calculate how many MIDI clock messages per minute there should be
-  based on the latest status update seen by the trigger, as found
-  cached in the user data (MIDI sends 24 clock pulses per quarter
-  note, so we multiply the trigger tempo by 24.) If the Expression
-  Global `:use-fixed-sync-bpm` has a value, we pretend the playing
-  track has that BPM and calculate the effective tempo based on the
-  player pitch."
-  [trigger-data]
-  (let [bpm-override (:use-fixed-sync-bpm #_:clj-kondo/ignore expression-globals)
-        base-tempo   (if-let [^CdjStatus cached-status (:status trigger-data)]
-                       (if (= 65535 (.getBpm cached-status))
-                         (or bpm-override 120.0) ; Default to 120 bpm if the player has not loaded a track.
-                         (if bpm-override
-                           (* (org.deepsymmetry.beatlink.Util/pitchToMultiplier (.getPitch cached-status)) bpm-override)
-                           (.getEffectiveTempo cached-status)))
-                       (or bpm-override 120.0))]  ; Default to 120 bpm if we lost status information momentarily.
-    (* base-tempo 24.0)))
-
-(defonce ^{:doc "How much the tempo must change (in beats per minute) before we adjust the MIDI clock rate."}
-  midi-clock-sensitivity
-  (atom 0.01))
-
-(defn- clock-running?
-  "Checks whether the supplied trigger data contains an active MIDI
-  clock sender thread. If so, returns a truthy value after alerting
-  the thread if a tempo change has occurred so that it can react
-  immediately. The actual value returned when the clock thread is
-  running will be a tuple of the thread, its metronome, and its
-  running flag, to make it easy to shut down when necessary."
-  [trigger-data]
-  (let [[^Thread clock-thread ^Metronome metro :as all] (:clock trigger-data)]
-    (when (and clock-thread (.isAlive clock-thread))
-      (let [tempo (clock-tempo trigger-data)]
-        (when (> (Math/abs (- tempo (.getTempo metro))) @midi-clock-sensitivity)
-          (.setTempo metro tempo)      ; Tempo has changed, update metronome, and...
-          (.interrupt clock-thread)))  ; wake up the thread so it can adjust immediately.
-      all)))
-
-(defn- start-clock
-  "Checks for, and creates if necessary, a thread that sends MIDI clock
-  pulses based on the effective BPM of the watched player. If the
-  thread is already running, but the tempo has changed from what it is
-  sending, interrupts the thread so it can immediately react to the
-  new tempo."
-  [trigger]
-  (try
-    (swap! (seesaw/user-data trigger)
-           (fn [trigger-data]
-             (if (clock-running? trigger-data)
-               trigger-data  ; Clock is already running, and we have alerted it to tempo changes, so leave it as-is.
-               (let [running      (atom true)  ; We need to create a new thread and its metronome and shutdown flag.
-                     metro        (Metronome.)
-                     clock-thread (Thread. #(clock-sender trigger metro running) "MIDI clock sender")]
-                 (.setTempo metro (clock-tempo trigger-data))
-                 (.setDaemon clock-thread true)
-                 (.setPriority clock-thread (dec Thread/MAX_PRIORITY))
-                 (.start clock-thread)
-                 (assoc trigger-data :clock [clock-thread metro running])))))
-    (catch Throwable t
-      (timbre/error t "Problem trying to start or update MIDI clock thread."))))
-
-
-(defn- stop-clock
-  "Checks for, and stops and cleans up if necessary, any clock
-  synchronization thread that might be running on the trigger. To
-  optimize the common case when we don't need to do anything,
-  `trigger-data` contains the already-loaded trigger user data."
-  [trigger trigger-data]
-  (when (clock-running? trigger-data)  ; Skip entirely if we have nothing to do.
-    (try
-      (swap! (seesaw/user-data trigger)
-             (fn [trigger-data]
-               (when-let [[^Thread clock-thread _ running] (clock-running? trigger-data)]
-                 (reset! running false)
-                 (.interrupt clock-thread))
-               (dissoc trigger-data :clock)))
-      (catch Throwable t
-        (timbre/error t "Problem trying to stop MIDI clock thread.")))))
 
 (defn- report-activation
-  "Send a message indicating the player a trigger is watching has
-  started playing, as long as the chosen output exists. `data`
-  contains the map retrieved from the trigger `user-data` atom which
-  is in the process of being updated, to save us from having to look
-  it up again. If `real?` is passed with a falsy value, this is being
-  done because the user chose to simulate the MIDI message or function
-  call, so interaction with Carabiner and MIDI Clock are suppressed."
+  "Trigger any custom Activation expression."
   ([trigger status data]
    (report-activation trigger status data true))
   ([trigger status data real?]
    (try
-     (let [{:keys [note channel message send start start-stop]} (:value data)]
-       (timbre/debug "Reporting activation:" message note "on channel" channel)
-       (when-let [output (get-chosen-output trigger data)]
-         (case message
-           "Note"  (midi/midi-note-on output note 127 (dec channel))
-           "CC"    (midi/midi-control output note 127 (dec channel))
-           "Clock" (when (and send real?)
-                     (midi/midi-send-msg (:receiver output) (if (= "Start" start) start-message continue-message) -1))
-           nil))
-       (when (and real? (= message "Link") (carabiner/sync-triggers?) start-stop)
-         (beat-carabiner/start-transport))
-       (run-trigger-function trigger :activation status (not real?)))
+     (run-trigger-function trigger :activation status (not real?))
      (catch Exception e
        (timbre/error e "Problem reporting player activation.")))))
 
 (defn- report-deactivation
-  "Send a message indicating the player a trigger is watching has
-  stopped playing, as long as the chosen output exists. `data`
-  contains the map retrieved from the trigger `user-data` atom which
-  is in the process of being updated, to save us from having to look
-  it up again. If `real?` is passed with a falsy value, this is being
-  done because the user chose to simulate the MIDI message or function
-  call, so interaction with Carabiner and MIDI Clock are suppressed."
+  "Trigger any custom Deactivation expression."
   ([trigger status data]
    (report-deactivation trigger status data true))
   ([trigger status data real?]
    (try
-     (let [{:keys [note channel message stop start-stop]} (:value data)]
-       (timbre/debug "Reporting deactivation:" message note "on channel" channel)
-       (when-let [output (get-chosen-output trigger data)]
-         (case message
-           "Note"  (midi/midi-note-off output note (dec channel))
-           "CC"    (midi/midi-control output note 0 (dec channel))
-           "Clock" (when (and stop real?) (midi/midi-send-msg (:receiver output) stop-message -1))
-           nil))
-       (when (and real? (= message "Link") (carabiner/sync-triggers?))
-         (beat-carabiner/unlock-tempo)
-         (when start-stop (beat-carabiner/stop-transport)))
-       (run-trigger-function trigger :deactivation status (not real?)))
+     (run-trigger-function trigger :deactivation status (not real?))
      (catch Exception e
        (timbre/error e "Problem reporting player deactivation.")))))
+
+(declare send-osc-if-configured!)
 
 (defn- update-player-state
   "If the Playing state of a device being watched by a trigger has
@@ -481,21 +276,18 @@
     (let [tripped (:tripped updated)]
       (when-not (= tripped (:tripped old-data))
         (if tripped
-          (report-activation trigger status updated)
-          (report-deactivation trigger status updated)))
-      (when (and tripped (= "Link" (:message (:value updated))))
-        (let [tempo (if-let [bpm-override (:use-fixed-sync-bpm @expression-globals)]
-                      (* (org.deepsymmetry.beatlink.Util/pitchToMultiplier (.getPitch status)) bpm-override)
-                      (.getEffectiveTempo status))]
-          (when (carabiner/sync-triggers?)
-            (if (beat-carabiner/valid-tempo? tempo)
-              (beat-carabiner/lock-tempo tempo)
-              (beat-carabiner/unlock-tempo))))))
-    (if (and (= "Clock" (:message (:value updated))) (enabled? trigger updated))
-      (start-clock trigger)
-      (stop-clock trigger updated)))
+          (do (report-activation trigger status updated)
+              (when (= "Activation" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+                (send-osc-if-configured! trigger status)))
+          (do (report-deactivation trigger status updated)
+              (when (= "Deactivation" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+                (send-osc-if-configured! trigger status)))))
+      )
+    )
   (when (some? status)
-    (run-trigger-function trigger :tracked status false))
+    (run-trigger-function trigger :tracked status false)
+    (when (= "Tracked Update" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+      (send-osc-if-configured! trigger status)))
   (seesaw/repaint! (seesaw/select trigger [:#state])))
 
 (defn describe-track
@@ -585,13 +377,13 @@
             (update-player-state trigger false false nil))
         (let [device-number (int (.number selection))
               found         (device-present? device-number)
-              status        (latest-status-for device-number)]
+              sel-status    (when found (latest-status-for device-number))]
           (if found
-            (if (instance? CdjStatus status)
+            (if (instance? CdjStatus sel-status)
               (do (seesaw/config! status-label :foreground (:valid-status-color @theme-colors))
-                  (seesaw/value! status-label (build-status-label status track-description metadata-summary)))
+                  (seesaw/value! status-label (build-status-label sel-status track-description metadata-summary)))
               (do (seesaw/config! status-label :foreground "red")
-                  (seesaw/value! status-label (cond (some? status)       "Non-Player status received."
+                  (seesaw/value! status-label (cond (some? sel-status)  "Non-Player status received."
                                                     (not (util/online?)) "Offline."
                                                     :else                "No status received."))))
             (do (seesaw/config! status-label :foreground "red")
@@ -600,28 +392,7 @@
     (catch Exception e
       (timbre/error e "Problem showing Trigger Player status."))))
 
-(defn- show-midi-status
-  "Set the visibility of the Enabled checkbox and the text and color
-  of its label based on whether the currently-selected MIDI output can
-  be found. This function must be called on the Swing Event Update
-  thread since it interacts with UI objects."
-  [trigger]
-  (try
-    (let [enabled-label (seesaw/select trigger [:#enabled-label])
-          enabled       (seesaw/select trigger [:#enabled])
-          state         (seesaw/select trigger [:#state])
-          output        (get-chosen-output trigger)]
-      (if (or output (no-output-chosen trigger))
-        (do (seesaw/config! enabled-label :foreground (UIManager/getColor "windowText"))
-            (seesaw/value! enabled-label "Enabled:")
-            (seesaw/config! enabled :visible? true)
-            (seesaw/config! state :visible? true))
-        (do (seesaw/config! enabled-label :foreground "red")
-            (seesaw/value! enabled-label "Not found.")
-            (seesaw/config! enabled :visible? false)
-            (seesaw/config! state :visible? false))))
-    (catch Exception e
-      (timbre/error e "Problem showing Trigger MIDI status."))))
+
 
 (defn get-triggers
   "Returns the list of triggers that currently exist. If `show` is
@@ -698,7 +469,11 @@
     (when-let [custom-fn (get-in data [:expression-fns kind])]
       (try
         (binding [*ns* (the-ns (expressions/expressions-namespace))]
-          [(custom-fn nil nil) nil])
+          (let [ret (custom-fn nil nil)]
+            (when (= "Setup" (get-in @trigger-prefs [:value :osc-send-on]))
+              (when-let [t (first (get-triggers))] ; best-effort: send for first trigger row
+                (send-osc-if-configured! t nil)))
+            [ret nil]))
         (catch Throwable t
           (timbre/error t "Problem running global " kind " expression,"
                         (get-in data [:expressions kind]))
@@ -855,6 +630,134 @@
   (let [trigger (.getParent (seesaw/to-widget e))]
     (swap! (seesaw/user-data trigger) assoc :value (seesaw/value trigger))))
 
+;; ----- OSC (Open Sound Control) support: client caching, templating, and sending -----
+
+(defonce osc-clients (atom {}))
+
+(defn- ensure-osc-loaded! []
+  (try (require 'overtone.osc)
+       (catch Throwable _)))
+
+(defn- broadcast-host?
+  "Returns true if host appears to be a broadcast address (any octet is 255)."
+  [host]
+  (try
+    (when (string? host)
+      (let [octets (clojure.string/split host #"\\.")]
+        (and (= 4 (count octets)) (some #(= % "255") octets))))
+    (catch Throwable _ false)))
+
+(defn- get-osc-client
+  [host port]
+  (ensure-osc-loaded!)
+  (let [k [host (int port)]]
+    (if-let [c (get @osc-clients k)]
+      c
+      (let [osc-client-fn (resolve 'overtone.osc/osc-client)
+            c             (osc-client-fn host (int port))]
+        (when (broadcast-host? host)
+          (try
+            (when-let [^java.net.DatagramSocket s (:socket c)]
+              (.setBroadcast s true))
+            (catch Throwable _)))
+        (swap! osc-clients assoc k c)
+        c))))
+
+(defn- close-all-osc-clients []
+  (ensure-osc-loaded!)
+  (let [close-fn (resolve 'overtone.osc/osc-close)]
+    (doseq [c (vals @osc-clients)]
+      (try (close-fn c) (catch Throwable _)))
+    (reset! osc-clients {})))
+
+(defn- template-tokens
+  "Extract placeholder names used in address and args strings."
+  [addr args]
+  (let [s (str (or addr "") "," (or args ""))]
+    (into #{} (map second (re-seq #"\{([a-zA-Z0-9_-]+)\}" s)))))
+
+(defonce ^{:private true}
+  osc-placeholder-fns (atom {}))
+
+(defn- ctx-fn-key [clazz tokens]
+  [clazz (vec (sort tokens))])
+
+(defn- build-ctx-fn
+  "Builds and caches a function that returns a map of token->value using expressions bindings."
+  [clazz tokens]
+  (let [k (ctx-fn-key clazz tokens)]
+    (if-let [f (get @osc-placeholder-fns k)]
+      f
+      (let [syms      (map symbol tokens)
+            pairs     (mapcat (fn [s] [(str ":" (name s)) (name s)]) syms)
+            form-str  (str "(hash-map " (clojure.string/join " " pairs) ")")
+            bindings  (expressions/bindings-for-update-class clazz)
+            f         (expressions/build-user-expression form-str bindings
+                                                         {:description "OSC placeholders"
+                                                          :fn-sym 'osc-placeholders
+                                                          :nil-status? false
+                                                          :no-locals? true})]
+        (swap! osc-placeholder-fns assoc k f)
+        f))))
+
+(defn- osc-context
+  "Build a map of values for placeholders using expressions convenience bindings."
+  [evt tokens]
+  (if (empty? tokens)
+    {}
+    (let [clazz (cond
+                  (instance? org.deepsymmetry.beatlink.Beat evt) org.deepsymmetry.beatlink.Beat
+                  (instance? CdjStatus evt)                        CdjStatus
+                  :else                                            org.deepsymmetry.beatlink.DeviceUpdate)
+          f     (build-ctx-fn clazz tokens)]
+      (try
+        (let [m (f evt {:locals nil})]
+          (if (map? m) m {}))
+        (catch Throwable _ {}))))
+)
+
+(defn- render-template
+  "Replace {name} occurrences using values in ctx. Unknowns -> empty."
+  [s ctx]
+  (when s
+    (clojure.string/replace s #"\{([a-zA-Z0-9_-]+)\}"
+                            (fn [[_ k]] (str (get ctx (keyword k) ""))))))
+
+(defn- send-osc-if-configured!
+  "Send a single OSC message if host/port/address are present."
+  [trigger status]
+  (ensure-osc-loaded!)
+  (let [cached (:value @(seesaw/user-data trigger))
+        live   (try (seesaw/invoke-now (seesaw/value trigger)) (catch Throwable _ nil))
+        val    (merge cached live)
+        host   (:osc-host val)
+        port   (:osc-port val)
+        addr   (:osc-address val)
+        args   (:osc-args val)]
+    (when (and (seq host) port (pos? (int port)) (seq addr))
+      (let [tokens (template-tokens addr args)
+            ctx    (osc-context status tokens)
+            path   (render-template addr ctx)
+            client (get-osc-client host (int port))
+            send-f (resolve 'overtone.osc/osc-send)
+            parsed (->> (when (and args (not (clojure.string/blank? args)))
+                          (clojure.string/split args #",") )
+                        (map clojure.string/trim)
+                        (remove clojure.string/blank?)
+                        (map #(render-template % ctx))
+                        (map (fn [s]
+                               (let [t (:osc-arg-type val "string")] 
+                                 (case t
+                                   "int"   (try (int (Math/round (Double/parseDouble s))) (catch Throwable _ 0))
+                                   "float" (try (float (Double/parseDouble s)) (catch Throwable _ (float 0)))
+                                   s))) )
+                        vec)]
+        (try
+          (timbre/debug "[OSC] sending" host port path parsed)
+          (apply send-f client path parsed)
+          (catch Throwable t
+            (timbre/warn t "OSC send failed" host port path)))))))
+
 (defn- missing-expression?
   "Checks whether the expression body of the specified kind is empty
   given a trigger panel."
@@ -863,11 +766,9 @@
 
 (defn- simulate-enabled?
   "Checks whether the specified event type can be simulated for the
-  given trigger (its message is Note or CC, or there is a non-empty
-  expression body)."
+  given trigger (there is a non-empty expression body)."
   [trigger event]
-  (let [message (get-in @(seesaw/user-data trigger) [:value :message])]
-    (or (#{"Note" "CC"} message) (not (missing-expression? trigger event)))))
+  (not (missing-expression? trigger event)))
 
 (defn- create-trigger-row
   "Create a row for watching a player in the trigger window.
@@ -898,51 +799,38 @@
                            "span, grow, wrap"]
 
                           [gear]
+                          ;; OSC Host, Watch, and Port on one row
+                          [(seesaw/label :text "OSC Host:")]
+                          [(seesaw/text :id :osc-host :text "127.0.0.1" :columns 12)]
                           ["Watch:" "alignx trailing"]
                           [(seesaw/combobox :id :players :model (get-player-choices)
                                             :listen [:item-state-changed cache-value])]
+                          [(seesaw/label :text "Port:")]
+                          [(seesaw/spinner :id :osc-port :model (seesaw/spinner-model 8000 :from 1 :to 65535))]
+                          [(seesaw/label :id :status-spacer :text "")  "wrap, hidemode 3"]
 
-                          [(seesaw/label :id :status :text "Checking...")  "gap unrelated, span, wrap"]
+                          ;; OSC configuration
+                          [(seesaw/label :text "Address:")]
+                          [(seesaw/text :id :osc-address :text "/blt/{device-number}" :columns 32) "span, grow, wrap"]
 
-                          ["MIDI Output:" "span 2, alignx trailing"]
-                          [(seesaw/combobox :id :outputs
-                                            :model (concat outputs
-                                                           ;; Preserve existing selection even if now missing.
-                                                           (when (and (some? m) (not ((set outputs) (:outputs m))))
-                                                             [(:outputs m)])
-                                                           ;; Offer escape hatch if no MIDI devices available.
-                                                           (when (and (:outputs m) (empty? outputs))
-                                                             [nil]))
-                                            :listen [:item-state-changed cache-value])]
+                          [(seesaw/label :text "Args (comma-separated):")]
+                          [(seesaw/text :id :osc-args :text "" :columns 32) "span, grow, wrap"]
 
-                          ["Message:" "gap unrelated"]
-                          [(seesaw/combobox :id :message :model ["Note" "CC" "Clock" "Link" "Custom"]
-                                            :listen [:item-state-changed cache-value])]
-
-                          [(seesaw/spinner :id :note :model (seesaw/spinner-model 127 :from 1 :to 127)
-                                           :listen [:state-changed cache-value]) "hidemode 3"]
-                          [(seesaw/checkbox :id :send :selected? true :visible? false
-                                            :listen [:state-changed cache-value]) "hidemode 3"]
-                          [(seesaw/checkbox :id :bar :text "Align bars" :selected? true :visible? false
-                                            :listen [:state-changed cache-value]) "hidemode 3"]
-                          [(seesaw/checkbox :id :start-stop :text "Start/Stop" :selected? false :visible? false
-                                            :listen [:state-changed cache-value]) "hidemode 3"]
-
-                          [(seesaw/label :id :channel-label :text "Channel:") "gap unrelated, hidemode 3"]
-                          [(seesaw/combobox :id :start :model ["Start" "Continue"] :visible? false
-                                            :listen [:item-state-changed cache-value]) "hidemode 3"]
-
-                          [(seesaw/spinner :id :channel :model (seesaw/spinner-model 1 :from 1 :to 16)
-                                           :listen [:state-changed cache-value]) "hidemode 3"]
-                          [(seesaw/checkbox :id :stop :text "Stop" :selected? true :visible? false
-                                            :listen [:item-state-changed cache-value]) "hidemode 3"]
-
-                          [(seesaw/label :id :enabled-label :text "Enabled:") "gap unrelated"]
+                          ;; Type, Send on, and Enabled on one row
+                          [(seesaw/label :text "Type:")]
+                          [(seesaw/combobox :id :osc-arg-type :model ["string" "float" "int"] :selected-item "string" :listen [:action-performed cache-value])]
+                          [(seesaw/label :text "Send on:")]
+                          [(seesaw/combobox :id :osc-send-on
+                                            :model ["Never" "Activation" "Deactivation" "Beat" "Tracked Update" "Setup" "Shutdown"]
+                                            :selected-item "Never")]
+                          [(seesaw/label :id :enabled-label :text "Enabled:")]
                           [(seesaw/combobox :id :enabled :model ["Never" "On-Air" "Custom" "Always"]
                                             :listen [:item-state-changed cache-value]) "hidemode 1"]
                           [(seesaw/canvas :id :state :size [18 :by 18] :opaque? false
                                           :tip "Trigger state: Outer ring shows enabled, inner light when tripped.")
-                           "wrap, hidemode 1"]]
+                           "wrap, hidemode 1"]
+                          ;; Status label at bottom, right aligned
+                          [(seesaw/label :id :status :text "Checking...")  "span, wrap"]]
 
                   :user-data (atom (initial-trigger-user-data)))
          export-action  (seesaw/action :handler (fn [_] (export-trigger panel))
@@ -1041,51 +929,26 @@
                                           (seesaw/invoke-later ; Make sure menu value cache update has happened.
                                             (swap! (seesaw/user-data panel) dissoc :status) ; Clear cached status.
                                             (show-device-status panel))))
-     (seesaw/listen (seesaw/select panel [:#outputs])
-                    :item-state-changed (fn [_] ; Update output status when selection changes.
-                                          ;; We need to do this later to ensure the other item-state-changed
-                                          ;; handler has had a chance to update the trigger data first.
-                                          (seesaw/invoke-later (show-midi-status panel))))
+     ;; Removed legacy MIDI/Link UI wiring.
 
-     ;; Tie the enabled state of the start/continue menu to the send checkbox
-     (let [{:keys [send start]} (seesaw/group-by-id panel)]
-       (bind/bind (bind/selection send)
-                  (bind/property start :enabled?)))
+     ;; Attach listeners for OSC fields to cache values
+     (doseq [id [:osc-host :osc-address :osc-args]]
+       (when-let [tf (seesaw/select panel [(keyword (str "#" (name id)))])]
+         (seesaw/listen tf :document (fn [_] (cache-value tf)))))
+     (when-let [cb (seesaw/select panel [:#osc-arg-type])]
+       (seesaw/listen cb :action-performed (fn [_] (cache-value cb))))
+     (when-let [sp (seesaw/select panel [:#osc-port])]
+       (seesaw/listen sp :state-changed (fn [_] (cache-value sp))))
+     (when-let [sendOn (seesaw/select panel [:#osc-send-on])]
+       (seesaw/listen sendOn :action-performed (fn [_] (cache-value sendOn))))
 
-     ;; Open an editor window if Custom is chosen for a message type and the activation expression is empty,
-     ;; and open the Carabiner Connection window if Link is chosen and there is no current connection.
-     ;; Also swap channel and note values for start/stop options when Clock is chosen, and for bar alignment
-     ;; and Link start/stop checkboxes when Link is chosen.
-     (let [message-menu (seesaw/select panel [:#message])]
-       (seesaw/listen
-        message-menu
-        :action-performed (fn [_]
-                            (let [choice                                (seesaw/selection message-menu)
-                                  {:keys [note send channel-label start
-                                          channel stop bar start-stop]} (seesaw/group-by-id panel)]
-                              (when (and (= "Custom" choice)
-                                         (not (:creating @(seesaw/user-data panel)))
-                                         (empty? (get-in @(seesaw/user-data panel) [:expressions :activation])))
-                                (editors/show-trigger-editor :activation panel #(update-gear-icon panel gear)))
-                              (when (and (= "Link" choice)
-                                         (not (beat-carabiner/active?)))
-                                (carabiner/show-window @trigger-frame))
-                              (cond
-                                (= "Clock" choice) (do (seesaw/hide! [note channel-label channel bar start-stop])
-                                                       (seesaw/show! [send start stop]))
-                                (= "Link" choice)  (do (seesaw/hide! [note channel-label channel send start stop])
-                                                       (seesaw/show! [bar start-stop]))
-                                :else              (do (seesaw/show! [note channel-label channel])
-                                                       (seesaw/hide! [send start stop bar start-stop])))))))
-
-     ;; If this trigger belongs to a show, record that fact.
-     (when show (swap! (seesaw/user-data panel) assoc :show-file (:file show)))
+    ;; If this trigger belongs to a show, record that fact.
+    (when show (swap! (seesaw/user-data panel) assoc :show-file (:file show)))
 
      (when (some? m) ; If there was a map passed to us to recreate our content, apply it now
        (load-trigger-from-map panel m gear))
      (swap! (seesaw/user-data panel) dissoc :creating)
      (show-device-status panel)
-     (show-midi-status panel)
      (cache-value gear) ; Cache the initial values of the choice sections
      panel)))
 
@@ -1135,11 +998,7 @@
         (reset! changed? true)))
     (when @changed? (adjust-triggers dark?))))
 
-(defonce ^{:private true
-           :doc "The menu action which opens the Carabiner configuration window."}
-  carabiner-action
-  (delay (seesaw/action :handler (fn [_] (carabiner/show-window @trigger-frame))
-                        :name "Ableton Link: Carabiner Connection")))
+;; Carabiner UI entry removed with Link support.
 
 (defonce ^{:private true
            :doc "The menu action which opens the nREPL configuration window."}
@@ -1175,7 +1034,8 @@
                                    (delete-all-triggers true)
                                    (seesaw/config! (seesaw/select @trigger-frame [:#triggers])
                                                    :items (concat [(create-trigger-row)] (get-triggers)))
-                                   (adjust-triggers))
+                                   (adjust-triggers)
+                                   (seesaw/dispose! confirm))
                                  (seesaw/dispose! confirm))
                                (catch Exception e
                                  (timbre/error e "Problem clearing Trigger list."))))
@@ -1303,34 +1163,7 @@
                   :name "Load from File"
                   :key "menu L")))
 
-(defn- midi-environment-changed
-  "Called when CoreMidi4J reports a change to the MIDI environment, so we can update the menu of
-  available MIDI outputs."
-  []
-  (seesaw/invoke-later  ; Need to move to the AWT event thread, since we interact with GUI objects
-   (try
-     (let [new-outputs (util/get-midi-outputs)
-           output-set  (set (map (fn [^MidiChoice choice] (.full_name choice)) new-outputs))]
-       ;; Remove any opened outputs that are no longer available in the MIDI environment
-       (swap! util/opened-outputs  #(apply dissoc % (clojure.set/difference (set (keys %)) output-set)))
 
-       (doseq [trigger (get-triggers)] ; Update the output menus in all trigger rows
-         (let [output-menu   (seesaw/select trigger [:#outputs])
-               old-selection (seesaw/selection output-menu)]
-           (seesaw/config! output-menu :model (concat new-outputs
-                                                      ;; Keep the old selection even if it is now missing.
-                                                      (when-not (output-set old-selection) [old-selection])
-                                                      ;; Allow deselection of a vanished output device
-                                                      ;; if there are now no devices available, so
-                                                      ;; tracks using custom expressions can still work.
-                                                      (when (and (some? old-selection) (empty? new-outputs)) [nil])))
-
-           ;; Keep our original selection chosen, even if it is now missing.
-           (seesaw/selection! output-menu old-selection))
-         (show-midi-status trigger))
-       (show/midi-environment-changed new-outputs output-set))
-     (catch Exception e
-       (timbre/error e "Problem responding to change in MIDI environment.")))))
 
 (defn- rebuild-all-device-status
   "Updates all player status descriptions to reflect the devices
@@ -1395,6 +1228,8 @@
                            (and (neg? (:number selection))  ; For Any Player, make sure beat's from the tracked player.
                                 (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))))
               (run-trigger-function trigger :beat beat false)
+              (when (= "Beat" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+                (send-osc-if-configured! trigger beat))
               (when (and (:tripped data) (= "Link" (:message value)) (carabiner/sync-triggers?))
                 (carabiner/beat-at-time (long (/ (.getTimestamp beat) 1000))
                                         (when (:bar value) (.getBeatWithinBar beat)))))))
@@ -1763,7 +1598,7 @@
                                                  @open-simulator-item
                                                  @player-status-action @load-track-action @load-settings-action
                                                  (seesaw/separator)
-                                                 @carabiner-action @overlay-server-action @nrepl-action]
+                                                 @overlay-server-action @nrepl-action]
                                          :id :network-menu)
                             (menus/build-help-menu)])))
 
@@ -1805,6 +1640,7 @@
   "Create and show the trigger window."
   []
   (try
+    (println "[BLT] create-trigger-window: building frame")
     (let [root           (seesaw/frame :title "Beat Link Triggers" :on-close :nothing
                                        :menubar (build-trigger-menubar))
           triggers       (seesaw/vertical-panel :id :triggers)
@@ -1815,7 +1651,9 @@
       (seesaw/config! triggers :items (recreate-trigger-rows))
       (adjust-triggers)
       (util/restore-window-position root :triggers nil)
+      (println "[BLT] create-trigger-window: showing frame")
       (seesaw/show! root)
+      (println "[BLT] create-trigger-window: frame shown")
       (check-for-parse-error)
       (prefs/register-ui-change-callback theme-callback)
       (seesaw/listen root
@@ -1838,6 +1676,7 @@
                      (fn [_] (util/save-window-position root :triggers))))
 
     (catch Exception e
+      (println "[BLT] create-trigger-window: exception" e)
       (timbre/error e "Problem creating Trigger window."))))
 
 (defn- reflect-online-state
@@ -1882,47 +1721,46 @@
   online operation. Returns truthy if the window was created for the
   first time."
   []
+  (println "[BLT] triggers.start entered")
   (let [already-created @trigger-frame]
     (if @trigger-frame
       (do
         (rebuild-all-device-status)
         (seesaw/show! @trigger-frame))
       (do
-        ;; Request notifications when MIDI devices appear or vanish
-        (CoreMidiDeviceProvider/addNotificationListener
-         (reify uk.co.xfactorylibrarians.coremidi4j.CoreMidiNotification
-           (midiSystemUpdated [_this]
-             (midi-environment-changed))))
+        ;; MIDI environment notifications removed.
 
         ;; Open the trigger window
         (swap! theme-colors assoc :valid-status-color
                (if (prefs/dark-mode?) Color/CYAN Color/BLUE))
         (create-trigger-window)
+        (println "[BLT] triggers.start: create-trigger-window returned")
 
         ;; Be able to react to players coming and going
         (.addDeviceAnnouncementListener device-finder device-listener)
         (.addUpdateListener virtual-cdj status-listener)
         (rebuild-all-device-status)  ; In case any came or went while we were setting up the listener
         (.addBeatListener (BeatFinder/getInstance) beat-listener)))  ; Allow triggers to respond to beats
-    (try
-      (.start (BeatFinder/getInstance))
-      (catch java.net.BindException e
-        (timbre/error e "Unable to start Beat Finder, is rekordbox or another instance running? Staying offline.")
-        (seesaw/invoke-now
-         (seesaw/alert @trigger-frame
-                       (str "<html>Unable to listen for beat packets, socket is in use.<br>"
-                            "Is rekordbox or another DJ Link program running?")
-                       :title "Failed to Go Online" :type :error)
-         (.stop virtual-cdj)
-         (.setSelected (online-menu-item) false)))
-      (catch Throwable t
-        (timbre/error t "Problem starting Beat Finder, staying offline.")
-        (seesaw/invoke-now
-         (seesaw/alert @trigger-frame
-                       (str "<html>Unable to listen for beat packets, check the log file for details.<br><br>" t)
-                       :title "Problem Trying to Go Online" :type :error)
-         (.stop virtual-cdj)
-         (.setSelected (online-menu-item) false))))
+    (when (util/online?)
+      (try
+        (.start (BeatFinder/getInstance))
+        (catch java.net.BindException e
+          (timbre/error e "Unable to start Beat Finder, is rekordbox or another instance running? Staying offline.")
+          (seesaw/invoke-now
+           (seesaw/alert @trigger-frame
+                         (str "<html>Unable to listen for beat packets, socket is in use.<br>"
+                              "Is rekordbox or another DJ Link program running?")
+                         :title "Failed to Go Online" :type :error)
+           (.stop virtual-cdj)
+           (.setSelected (online-menu-item) false)))
+        (catch Throwable t
+          (timbre/error t "Problem starting Beat Finder, staying offline.")
+          (seesaw/invoke-now
+           (seesaw/alert @trigger-frame
+                         (str "<html>Unable to listen for beat packets, check the log file for details.<br><br>" t)
+                         :title "Problem Trying to Go Online" :type :error)
+           (.stop virtual-cdj)
+           (.setSelected (online-menu-item) false)))))
     (.setPassive metadata-finder true)  ; Start out conservatively
     (when (util/online?)
       (start-other-finders)
@@ -1961,6 +1799,7 @@
      (.stop (org.deepsymmetry.beatlink.dbserver.ConnectionManager/getInstance))
      (.stop virtual-cdj)
      (Thread/sleep 200))  ; Wait for straggling update packets
+     (close-all-osc-clients)
    (reflect-online-state)
    (rebuild-all-device-status)))
 
