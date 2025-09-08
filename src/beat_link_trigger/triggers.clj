@@ -286,7 +286,8 @@
     )
   (when (some? status)
     (run-trigger-function trigger :tracked status false)
-    (when (= "Tracked Update" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+    (when (and (= "Tracked Update" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+               (enabled? trigger))
       (send-osc-if-configured! trigger status)))
   (seesaw/repaint! (seesaw/select trigger [:#state])))
 
@@ -579,6 +580,7 @@
 
 (declare export-trigger)
 (declare import-trigger)
+(declare format-trigger)
 
 (defn- initial-trigger-user-data
   "Create the values to assign the user-data atom for a freshly
@@ -766,9 +768,15 @@
 
 (defn- simulate-enabled?
   "Checks whether the specified event type can be simulated for the
-  given trigger (there is a non-empty expression body)."
+  given trigger. Always allow Activation/Deactivation; for Beat and
+  Tracked Update, enable when an expression body exists."
   [trigger event]
-  (not (missing-expression? trigger event)))
+  (case event
+    :activation true
+    :deactivation true
+    :beat true
+    :tracked true
+    (not (missing-expression? trigger event))))
 
 (defn- create-trigger-row
   "Create a row for watching a player in the trigger window.
@@ -800,12 +808,15 @@
 
                           [gear]
                           ;; OSC Host, Watch, and Port on one row
-                          [(seesaw/label :text "OSC Host:")]
-                          [(seesaw/text :id :osc-host :text "127.0.0.1" :columns 12)]
+
                           ["Watch:" "alignx trailing"]
                           [(seesaw/combobox :id :players :model (get-player-choices)
                                             :listen [:item-state-changed cache-value])]
-                          [(seesaw/label :text "Port:")]
+
+                          [(seesaw/label :text "OSC Host:") "alignx trailing"]
+                          [(seesaw/text :id :osc-host :text "127.0.0.1" :columns 12)]
+
+                          [(seesaw/label :text "Port:") "alignx trailing"]
                           [(seesaw/spinner :id :osc-port :model (seesaw/spinner-model 8000 :from 1 :to 65535))]
                           [(seesaw/label :id :status-spacer :text "")  "wrap, hidemode 3"]
 
@@ -813,17 +824,17 @@
                           [(seesaw/label :text "Address:")]
                           [(seesaw/text :id :osc-address :text "/blt/{device-number}" :columns 32) "span, grow, wrap"]
 
-                          [(seesaw/label :text "Args (comma-separated):")]
-                          [(seesaw/text :id :osc-args :text "" :columns 32) "span, grow, wrap"]
+                          [(seesaw/label :text "Message:")]
+                          [(seesaw/text :id :osc-args :text "{track-artist} - {track-title} - {effective-tempo}" :columns 32) "span, grow, wrap"]
 
                           ;; Type, Send on, and Enabled on one row
-                          [(seesaw/label :text "Type:")]
-                          [(seesaw/combobox :id :osc-arg-type :model ["string" "float" "int"] :selected-item "string" :listen [:action-performed cache-value])]
-                          [(seesaw/label :text "Send on:")]
+                          [(seesaw/label :text "Type:") "skip 1, alignx trailing"]
+                          [(seesaw/combobox :id :osc-arg-type :model ["String" "Float" "Int"] :selected-item "string" :listen [:action-performed cache-value])]
+                          [(seesaw/label :text "Send on:") "alignx trailing"]
                           [(seesaw/combobox :id :osc-send-on
                                             :model ["Never" "Activation" "Deactivation" "Beat" "Tracked Update" "Setup" "Shutdown"]
-                                            :selected-item "Never")]
-                          [(seesaw/label :id :enabled-label :text "Enabled:")]
+                                            :selected-item "Beat")]
+                          [(seesaw/label :id :enabled-label :text "Enabled:") "alignx trailing"]
                           [(seesaw/combobox :id :enabled :model ["Never" "On-Air" "Custom" "Always"]
                                             :listen [:item-state-changed cache-value]) "hidemode 1"]
                           [(seesaw/canvas :id :state :size [18 :by 18] :opaque? false
@@ -872,24 +883,39 @@
          sim-actions    (fn []
                           [(seesaw/action :name "Activation"
                                           :enabled? (simulate-enabled? panel :activation)
-                                          :handler (fn [_] (binding [util/*simulating* (util/data-for-simulation)]
-                                                             (report-activation panel (show-util/random-cdj-status)
-                                                                                @(seesaw/user-data panel) false))))
+                                          :handler (fn [_]
+                                                     (binding [util/*simulating* (util/data-for-simulation)]
+                                                       (let [status (show-util/random-cdj-status)]
+                                                         (report-activation panel status @(seesaw/user-data panel) false)
+                                                         (when (= "Activation" (get-in (:value @(seesaw/user-data panel)) [:osc-send-on]))
+                                                           (send-osc-if-configured! panel status)))))
+                           )
                            (seesaw/action :name "Beat"
-                                          :enabled? (not (missing-expression? panel :beat))
-                                          :handler (fn [_] (binding [util/*simulating* (util/data-for-simulation)]
-                                                             (run-trigger-function panel :beat
-                                                                                   (show-util/random-beat) true))))
+                                          :enabled? (simulate-enabled? panel :beat)
+                                          :handler (fn [_]
+                                                     (binding [util/*simulating* (util/data-for-simulation)]
+                                                       (let [beat (show-util/random-beat)]
+                                                         (run-trigger-function panel :beat beat true)
+                                                         (when (and (= "Beat" (get-in (:value @(seesaw/user-data panel)) [:osc-send-on]))
+                                                                    (enabled? panel))
+                                                           (send-osc-if-configured! panel beat))))))
                            (seesaw/action :name "Tracked Update"
-                                          :enabled? (not (missing-expression? panel :tracked))
-                                          :handler (fn [_] (binding [util/*simulating* (util/data-for-simulation)]
-                                                             (run-trigger-function
-                                                              panel :tracked (show-util/random-cdj-status) true))))
+                                          :enabled? (simulate-enabled? panel :tracked)
+                                          :handler (fn [_]
+                                                     (binding [util/*simulating* (util/data-for-simulation)]
+                                                       (let [status (show-util/random-cdj-status)]
+                                                         (run-trigger-function panel :tracked status true)
+                                                         (when (and (= "Tracked Update" (get-in (:value @(seesaw/user-data panel)) [:osc-send-on]))
+                                                                    (enabled? panel))
+                                                           (send-osc-if-configured! panel status))))))
                            (seesaw/action :name "Deactivation"
                                           :enabled? (simulate-enabled? panel :deactivation)
-                                          :handler (fn [_] (binding [util/*simulating* (util/data-for-simulation)]
-                                                             (report-deactivation panel (show-util/random-cdj-status)
-                                                                                  @(seesaw/user-data panel) false))))])
+                                          :handler (fn [_]
+                                                     (binding [util/*simulating* (util/data-for-simulation)]
+                                                       (let [status (show-util/random-cdj-status)]
+                                                         (report-deactivation panel status @(seesaw/user-data panel) false)
+                                                         (when (= "Deactivation" (get-in (:value @(seesaw/user-data panel)) [:osc-send-on]))
+                                                           (send-osc-if-configured! panel status))))))])
          popup-fn       (fn [_] (concat (report-actions) (editor-actions)
                                         [(seesaw/separator) (seesaw/menu :text "Simulate" :items (sim-actions))
                                          inspect-action (seesaw/separator) import-action export-action]
@@ -957,11 +983,16 @@
   new-trigger-action
   (delay
    (seesaw/action :handler (fn [_]
-                             (seesaw/config! (seesaw/select @trigger-frame [:#triggers])
-                                             :items (concat (get-triggers nil) [(create-trigger-row)]
-                                                            (filter #(some? (:show-file @(seesaw/user-data %)))
-                                                                    (get-triggers))))
-                             (adjust-triggers))
+                             (let [non-show      (get-triggers nil)
+                                   last-nonshow  (last non-show)
+                                   m             (when last-nonshow (assoc (format-trigger last-nonshow) :enabled "Never"))
+                                   new-index     (inc (count non-show))
+                                   new-row       (create-trigger-row m new-index)]
+                               (seesaw/config! (seesaw/select @trigger-frame [:#triggers])
+                                               :items (concat non-show [new-row]
+                                                              (filter #(some? (:show-file @(seesaw/user-data %)))
+                                                                      (get-triggers))))
+                               (adjust-triggers)))
                   :name "New Trigger"
                   :key "menu T")))
 
@@ -1228,7 +1259,8 @@
                            (and (neg? (:number selection))  ; For Any Player, make sure beat's from the tracked player.
                                 (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))))
               (run-trigger-function trigger :beat beat false)
-              (when (= "Beat" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+              (when (and (= "Beat" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
+                         (enabled? trigger))
                 (send-osc-if-configured! trigger beat))
               (when (and (:tripped data) (= "Link" (:message value)) (carabiner/sync-triggers?))
                 (carabiner/beat-at-time (long (/ (.getTimestamp beat) 1000))
@@ -1650,6 +1682,8 @@
       (reset! trigger-frame root)
       (seesaw/config! triggers :items (recreate-trigger-rows))
       (adjust-triggers)
+      ;; Pack to preferred size so the window isn't wider than needed on first run
+      (seesaw/pack! root)
       (util/restore-window-position root :triggers nil)
       (println "[BLT] create-trigger-window: showing frame")
       (seesaw/show! root)

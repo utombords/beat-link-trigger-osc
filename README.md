@@ -1,4 +1,17 @@
-# beat-link-trigger
+> Fork notice — beat-link-trigger-osc  
+> Focused fork of Deep‑Symmetry/beat-link-trigger with a simplified OSC sender UI.
+>
+> Upstream: https://github.com/Deep-Symmetry/beat-link-trigger  
+> Releases for this fork: https://github.com/utombords/beat-link-trigger-osc/releases  
+> License: EPL‑2.0 (unchanged). Support is best‑effort here; use upstream channels for general BLT issues.
+
+### Differences:
+- Adds OSC sending with expression placeholders (e.g. `{device-number}`, `{track-artist}`, `{track-title}`, `{effective-tempo}`) that can be used in both the OSC address and message, with a UI for configuration.
+- Legacy MIDI UI removed (OSC-focused).
+
+<img src="doc/modules/ROOT/images/OscUi.png" alt="OSC UI">
+
+
 
 [![project chat](https://img.shields.io/badge/chat-on%20zulip-brightgreen)](https://deep-symmetry.zulipchat.com/#narrow/stream/275322-beat-link-trigger)
  <img align="right" width="275" height="250" alt="Beat Link Trigger"
