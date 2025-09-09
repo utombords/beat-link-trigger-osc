@@ -236,7 +236,8 @@
   (let [visible (try (sort (util/visible-player-numbers)) (catch Throwable _ []))
         base    [-1 0]
         fallback [1 2 3 4]
-        nums    (distinct (concat base (if (seq visible) visible fallback)))]
+        ;; Always show 1–4, and also include any visible players (e.g., 5/6)
+        nums    (distinct (concat base fallback visible))]
     (map #(PlayerChoice. %) nums)))
 
 
@@ -1234,18 +1235,10 @@
                            :selection selection
                            :matches (matching-player-number? status trigger selection)))
             (when (and (instance? CdjStatus status) (matching-player-number? status trigger selection))
-              (let [^CdjStatus status status
-                    p1 (.getPlayState1 status)
-                    p2 (.getPlayState2 status)
-                    effective-playing (or (.isPlaying status)
-                                          (= p2 org.deepsymmetry.beatlink.CdjStatus$PlayState2/MOVING)
-                                          (= p2 org.deepsymmetry.beatlink.CdjStatus$PlayState2/OPUS_MOVING)
-                                          (= p1 org.deepsymmetry.beatlink.CdjStatus$PlayState1/PLAYING)
-                                          (= p1 org.deepsymmetry.beatlink.CdjStatus$PlayState1/LOOPING)
-                                          (= p1 org.deepsymmetry.beatlink.CdjStatus$PlayState1/CUE_PLAYING))]
+              (let [^CdjStatus status status]
                 (when-not (neg? (:number selection))
                   (run-custom-enabled status trigger)) ; This was already done if Any Player is the selection
-                (update-player-state trigger effective-playing (.isOnAir status) status)
+                (update-player-state trigger (.isPlaying status) (.isOnAir status) status)
                 (seesaw/invoke-later
                  (let [status-label (seesaw/select trigger [:#status])
                        track-description (:track-description @(:locals @(seesaw/user-data trigger)))
