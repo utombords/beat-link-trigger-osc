@@ -1229,10 +1229,10 @@
         (doseq [trigger (get-triggers)]
           (let [selection (get-in @(seesaw/user-data trigger) [:value :players])]
             (when (instance? CdjStatus status)
-              (timbre/debug "[Trigger] status" :device (.getDeviceNumber ^CdjStatus status)
-                            :playing (.isPlaying ^CdjStatus status)
-                            :selection selection
-                            :matches (matching-player-number? status trigger selection)))
+              (timbre/info "[Trigger] status" :device (.getDeviceNumber ^CdjStatus status)
+                           :playing (.isPlaying ^CdjStatus status)
+                           :selection selection
+                           :matches (matching-player-number? status trigger selection)))
             (when (and (instance? CdjStatus status) (matching-player-number? status trigger selection))
               (let [^CdjStatus status status]
                 (when-not (neg? (:number selection))
@@ -1259,9 +1259,9 @@
           (let [data      @(seesaw/user-data trigger)
                 value     (:value data)
                 selection (:players value)]
-            (timbre/debug "[Trigger] beat" :device (.getDeviceNumber beat)
-                          :selection selection
-                          :tracked (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))
+            (timbre/info "[Trigger] beat" :device (.getDeviceNumber beat)
+                         :selection selection
+                         :tracked (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))
             (when (and (some? selection)
                        (or (= (:number selection) (.getDeviceNumber beat))
                            (and (zero? (:number selection))

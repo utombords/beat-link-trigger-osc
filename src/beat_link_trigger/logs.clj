@@ -36,22 +36,26 @@
    (reify Thread$UncaughtExceptionHandler
      (uncaughtException [_ thread e]
        (timbre/error e "Uncaught exception on" (.getName thread)))))
-  (timbre/set-config!
-   {:min-level :info #_ [["taoensso.*" :error] ["*" :debug]]
+  ;; Allow overriding log level via system property or environment variable
+  (let [lvl-str (or (System/getProperty "blt.log-level") (System/getenv "BLT_LOG_LEVEL"))
+        lvl-key (some-> lvl-str clojure.string/lower-case keyword)
+        level   (if (#{:trace :debug :info :warn :error :fatal} lvl-key) lvl-key :info)]
+    (timbre/set-config!
+     {:min-level level #_ [["taoensso.*" :error] ["*" :debug]]
 
-    ;; Control log filtering by namespaces/patterns. Useful for turning off
-    ;; logging in noisy libraries, etc.:
-    :ns-filter #{"*"} #_{:deny #{"taoensso.*"} :allow #{"*"}}
+      ;; Control log filtering by namespaces/patterns. Useful for turning off
+      ;; logging in noisy libraries, etc.:
+      :ns-filter #{"*"} #_{:deny #{"taoensso.*"} :allow #{"*"}}
 
-    :middleware [] ; (fns [data]) -> ?data, applied left->right
+      :middleware [] ; (fns [data]) -> ?data, applied left->right
 
-    :timestamp-opts {:pattern  "yyyy-MMM-dd HH:mm:ss.SSS"
-                     :locale   :jvm-default
-                     :timezone (java.util.TimeZone/getDefault)}
+      :timestamp-opts {:pattern  "yyyy-MMM-dd HH:mm:ss.SSS"
+                       :locale   :jvm-default
+                       :timezone (java.util.TimeZone/getDefault)}
 
-    :output-fn   timbre/default-output-fn ; (fn [data]) -> string
-    :output-opts {:stacktrace-fonts {}}
-    })
+      :output-fn   timbre/default-output-fn ; (fn [data]) -> string
+      :output-opts {:stacktrace-fonts {}}
+      }))
 
   ;; Install the desired log appenders
   (let [max-size 200000
