@@ -230,10 +230,14 @@
 
 (defn get-player-choices
   "Returns a sorted list of the player watching choices, including
-  options to watch Any Player and the Master Player."
+  options to watch Any Player and the Master Player, plus any
+  currently visible player numbers (handles CDJ-3000 5/6, etc.)."
   []
-  (for [i (range -1 5)]
-    (PlayerChoice. i)))
+  (let [visible (try (sort (util/visible-player-numbers)) (catch Throwable _ []))
+        base    [-1 0]
+        fallback [1 2 3 4]
+        nums    (distinct (concat base (if (seq visible) visible fallback)))]
+    (map #(PlayerChoice. %) nums)))
 
 
 
@@ -1224,6 +1228,11 @@
       (try
         (doseq [trigger (get-triggers)]
           (let [selection (get-in @(seesaw/user-data trigger) [:value :players])]
+            (when (instance? CdjStatus status)
+              (timbre/debug "[Trigger] status" :device (.getDeviceNumber ^CdjStatus status)
+                            :playing (.isPlaying ^CdjStatus status)
+                            :selection selection
+                            :matches (matching-player-number? status trigger selection)))
             (when (and (instance? CdjStatus status) (matching-player-number? status trigger selection))
               (let [^CdjStatus status status]
                 (when-not (neg? (:number selection))
@@ -1250,6 +1259,9 @@
           (let [data      @(seesaw/user-data trigger)
                 value     (:value data)
                 selection (:players value)]
+            (timbre/debug "[Trigger] beat" :device (.getDeviceNumber beat)
+                          :selection selection
+                          :tracked (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))
             (when (and (some? selection)
                        (or (= (:number selection) (.getDeviceNumber beat))
                            (and (zero? (:number selection))
