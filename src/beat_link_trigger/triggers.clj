@@ -261,6 +261,20 @@
      (catch Exception e
        (timbre/error e "Problem reporting player deactivation.")))))
 
+;; Briefly mark a trigger as tripped so the UI pulses the inner indicator
+(defn- pulse-tripped!
+  [trigger]
+  (swap! (seesaw/user-data trigger) assoc :tripped true)
+  (seesaw/repaint! (seesaw/select trigger [:#state]))
+  (let [t (javax.swing.Timer.
+           180
+           (proxy [java.awt.event.ActionListener] []
+             (actionPerformed [_]
+               (swap! (seesaw/user-data trigger) assoc :tripped false)
+               (seesaw/repaint! (seesaw/select trigger [:#state])))))]
+    (.setRepeats t false)
+    (.start t)))
+
 (declare send-osc-if-configured!)
 
 (defn- update-player-state
@@ -1271,6 +1285,7 @@
                            (and (neg? (:number selection))  ; For Any Player, make sure beat's from the tracked player.
                                 (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))))
               (run-trigger-function trigger :beat beat false)
+              (pulse-tripped! trigger)
               (when (and (= "Beat" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
                          (enabled? trigger))
                 (send-osc-if-configured! trigger beat))
