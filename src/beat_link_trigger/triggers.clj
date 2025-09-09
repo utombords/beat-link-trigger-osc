@@ -1234,10 +1234,14 @@
                            :selection selection
                            :matches (matching-player-number? status trigger selection)))
             (when (and (instance? CdjStatus status) (matching-player-number? status trigger selection))
-              (let [^CdjStatus status status]
+              (let [^CdjStatus status status
+                    now         (System/currentTimeMillis)
+                    data        @(seesaw/user-data trigger)
+                    recent-beat? (when-let [ts (:last-beat-ts data)] (< (- now ts) 1500))
+                    playing     (or (.isPlaying status) recent-beat?)]
                 (when-not (neg? (:number selection))
                   (run-custom-enabled status trigger)) ; This was already done if Any Player is the selection
-                (update-player-state trigger (.isPlaying status) (.isOnAir status) status)
+                (update-player-state trigger playing (.isOnAir status) status)
                 (seesaw/invoke-later
                  (let [status-label (seesaw/select trigger [:#status])
                        track-description (:track-description @(:locals @(seesaw/user-data trigger)))
@@ -1270,6 +1274,9 @@
                                       (:master simulator))))
                            (and (neg? (:number selection))  ; For Any Player, make sure beat's from the tracked player.
                                 (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))))
+              ;; Record that we have a recent beat from this device and optimistically mark as playing for UI
+              (swap! (seesaw/user-data trigger) assoc :last-beat-ts (System/currentTimeMillis) :playing true)
+              (seesaw/repaint! (seesaw/select trigger [:#state]))
               (run-trigger-function trigger :beat beat false)
               (when (and (= "Beat" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
                          (enabled? trigger))
