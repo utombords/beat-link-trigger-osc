@@ -261,20 +261,6 @@
      (catch Exception e
        (timbre/error e "Problem reporting player deactivation.")))))
 
-;; Briefly mark a trigger as tripped so the UI pulses the inner indicator
-(defn- pulse-tripped!
-  [trigger]
-  (swap! (seesaw/user-data trigger) assoc :tripped true)
-  (seesaw/repaint! (seesaw/select trigger [:#state]))
-  (let [t (javax.swing.Timer.
-           180
-           (proxy [java.awt.event.ActionListener] []
-             (actionPerformed [_]
-               (swap! (seesaw/user-data trigger) assoc :tripped false)
-               (seesaw/repaint! (seesaw/select trigger [:#state])))))]
-    (.setRepeats t false)
-    (.start t)))
-
 (declare send-osc-if-configured!)
 
 (defn- update-player-state
@@ -1248,10 +1234,18 @@
                            :selection selection
                            :matches (matching-player-number? status trigger selection)))
             (when (and (instance? CdjStatus status) (matching-player-number? status trigger selection))
-              (let [^CdjStatus status status]
+              (let [^CdjStatus status status
+                    p1 (.getPlayState1 status)
+                    p2 (.getPlayState2 status)
+                    effective-playing (or (.isPlaying status)
+                                          (= p2 org.deepsymmetry.beatlink.CdjStatus$PlayState2/MOVING)
+                                          (= p2 org.deepsymmetry.beatlink.CdjStatus$PlayState2/OPUS_MOVING)
+                                          (= p1 org.deepsymmetry.beatlink.CdjStatus$PlayState1/PLAYING)
+                                          (= p1 org.deepsymmetry.beatlink.CdjStatus$PlayState1/LOOPING)
+                                          (= p1 org.deepsymmetry.beatlink.CdjStatus$PlayState1/CUE_PLAYING))]
                 (when-not (neg? (:number selection))
                   (run-custom-enabled status trigger)) ; This was already done if Any Player is the selection
-                (update-player-state trigger (.isPlaying status) (.isOnAir status) status)
+                (update-player-state trigger effective-playing (.isOnAir status) status)
                 (seesaw/invoke-later
                  (let [status-label (seesaw/select trigger [:#status])
                        track-description (:track-description @(:locals @(seesaw/user-data trigger)))
@@ -1285,7 +1279,6 @@
                            (and (neg? (:number selection))  ; For Any Player, make sure beat's from the tracked player.
                                 (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))))
               (run-trigger-function trigger :beat beat false)
-              (pulse-tripped! trigger)
               (when (and (= "Beat" (get-in (:value @(seesaw/user-data trigger)) [:osc-send-on]))
                          (enabled? trigger))
                 (send-osc-if-configured! trigger beat))
