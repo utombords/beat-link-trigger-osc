@@ -194,7 +194,14 @@ jobs:
           echo "uberjar_name=$uberjarName" >>$GITHUB_ENV
           buildVersion=${release_tag%-SNAPSHOT}
           buildVersion=${buildVersion#v}
+          # macOS app-version must be 1-3 numeric parts; normalize if 4+
+          if [[ "$buildVersion" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            buildVersionShort="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          else
+            buildVersionShort="$buildVersion"
+          fi
           echo "build_version=$buildVersion" >>$GITHUB_ENV
+          echo "mac_app_version=$buildVersionShort" >>$GITHUB_ENV
           dmgName="Beat Link Trigger-$buildVersion.dmg"
           echo "dmg_name=$dmgName" >>$GITHUB_ENV
           artifactName="Beat-Link-Trigger-$git_version-MacOS.dmg"
@@ -218,6 +225,7 @@ jobs:
           IDENTITY_PASSPHRASE: ${{ secrets.IDENTITY_PASSPHRASE }}
           IDENTITY_P12_B64: ${{ secrets.IDENTITY_P12_B64 }}
           NOTARIZATION_PW: ${{ secrets.NOTARIZATION_PW }}
+          build_version: ${{ env.mac_app_version }}
         run: zsh .github/scripts/build_dmg.zsh
 
   build_intel_dmg:
@@ -240,7 +248,14 @@ jobs:
           echo "uberjar_name=$uberjarName" >>$GITHUB_ENV
           buildVersion=${release_tag%-SNAPSHOT}
           buildVersion=${buildVersion#v}
+          # macOS app-version must be 1-3 numeric parts; normalize if 4+
+          if [[ "$buildVersion" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            buildVersionShort="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          else
+            buildVersionShort="$buildVersion"
+          fi
           echo "build_version=$buildVersion" >>$GITHUB_ENV
+          echo "mac_app_version=$buildVersionShort" >>$GITHUB_ENV
           dmgName="Beat Link Trigger-$buildVersion.dmg"
           echo "dmg_name=$dmgName" >>$GITHUB_ENV
           artifactName="Beat-Link-Trigger-$git_version-MacOS-Intel.dmg"
@@ -265,6 +280,7 @@ jobs:
           IDENTITY_PASSPHRASE: ${{ secrets.IDENTITY_PASSPHRASE }}
           IDENTITY_P12_B64: ${{ secrets.IDENTITY_P12_B64 }}
           NOTARIZATION_PW: ${{ secrets.NOTARIZATION_PW }}
+          build_version: ${{ env.mac_app_version }}
         run: zsh .github/scripts/build_dmg.zsh
 
   finish_release:

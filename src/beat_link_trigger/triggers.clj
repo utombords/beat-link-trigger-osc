@@ -25,6 +25,7 @@
             [fipp.edn :as fipp]
             [inspector-jay.core :as inspector]
             [overtone.osc :as osc]
+            [beat-link-trigger.osc :as blt-osc]
             [seesaw.bind :as bind]
             [seesaw.chooser :as chooser]
             [seesaw.core :as seesaw]
@@ -637,45 +638,7 @@
   (let [trigger (.getParent (seesaw/to-widget e))]
     (swap! (seesaw/user-data trigger) assoc :value (seesaw/value trigger))))
 
-;; ----- OSC (Open Sound Control) support: client caching, templating, and sending -----
-
-(defonce osc-clients (atom {}))
-
-(defn- ensure-osc-loaded! []
-  (try (require 'overtone.osc)
-       (catch Throwable _)))
-
-(defn- broadcast-host?
-  "Returns true if host appears to be a broadcast address (any octet is 255)."
-  [host]
-  (try
-    (when (string? host)
-      (let [octets (clojure.string/split host #"\\.")]
-        (and (= 4 (count octets)) (some #(= % "255") octets))))
-    (catch Throwable _ false)))
-
-(defn- get-osc-client
-  [host port]
-  (ensure-osc-loaded!)
-  (let [k [host (int port)]]
-    (if-let [c (get @osc-clients k)]
-      c
-      (let [osc-client-fn (resolve 'overtone.osc/osc-client)
-            c             (osc-client-fn host (int port))]
-        (when (broadcast-host? host)
-          (try
-            (when-let [^java.net.DatagramSocket s (:socket c)]
-              (.setBroadcast s true))
-            (catch Throwable _)))
-        (swap! osc-clients assoc k c)
-        c))))
-
-(defn- close-all-osc-clients []
-  (ensure-osc-loaded!)
-  (let [close-fn (resolve 'overtone.osc/osc-close)]
-    (doseq [c (vals @osc-clients)]
-      (try (close-fn c) (catch Throwable _)))
-    (reset! osc-clients {})))
+;; ----- OSC (Open Sound Control) support: templating and enqueueing -----
 
 (defn- template-tokens
   "Extract placeholder names used in address and args strings."
@@ -731,39 +694,47 @@
                             (fn [[_ k]] (str (get ctx (keyword k) ""))))))
 
 (defn- send-osc-if-configured!
-  "Send a single OSC message if host/port/address are present."
-  [trigger status]
-  (ensure-osc-loaded!)
-  (let [cached (:value @(seesaw/user-data trigger))
-        live   (try (seesaw/invoke-now (seesaw/value trigger)) (catch Throwable _ nil))
-        val    (merge cached live)
-        host   (:osc-host val)
-        port   (:osc-port val)
-        addr   (:osc-address val)
-        args   (:osc-args val)]
-    (when (and (seq host) port (pos? (int port)) (seq addr))
-      (let [tokens (template-tokens addr args)
-            ctx    (osc-context status tokens)
-            path   (render-template addr ctx)
-            client (get-osc-client host (int port))
-            send-f (resolve 'overtone.osc/osc-send)
-            parsed (->> (when (and args (not (clojure.string/blank? args)))
-                          (clojure.string/split args #",") )
-                        (map clojure.string/trim)
-                        (remove clojure.string/blank?)
-                        (map #(render-template % ctx))
-                        (map (fn [s]
-                               (let [t (:osc-arg-type val "string")] 
-                                 (case t
-                                   "int"   (try (int (Math/round (Double/parseDouble s))) (catch Throwable _ 0))
-                                   "float" (try (float (Double/parseDouble s)) (catch Throwable _ (float 0)))
-                                   s))) )
-                        vec)]
-        (try
-          (timbre/debug "[OSC] sending" host port path parsed)
-          (apply send-f client path parsed)
-          (catch Throwable t
-            (timbre/warn t "OSC send failed" host port path)))))))
+  "Render and enqueue an OSC message using cached UI config. When called with
+   2 args, derive the kind from the trigger's :osc-send-on setting.
+   kind is one of :activation :deactivation :beat :tracked :setup :shutdown."
+  ([trigger status]
+   (let [sel  (some-> @(seesaw/user-data trigger) :value :osc-send-on)
+         kind (case sel
+                "Activation"      :activation
+                "Deactivation"    :deactivation
+                "Beat"            :beat
+                "Tracked Update"  :tracked
+                "Setup"           :setup
+                "Shutdown"        :shutdown
+                :beat)]
+     (send-osc-if-configured! trigger status kind)))
+  ([trigger status kind]
+   (let [val  (:value @(seesaw/user-data trigger))
+         host (:osc-host val)
+         port (:osc-port val)
+         addr (:osc-address val)
+         args (:osc-args val)]
+     (when (and (seq host) port (pos? (int port)) (seq addr))
+       (let [tokens (template-tokens addr args)
+             ctx    (osc-context status tokens)
+             path   (render-template addr ctx)
+             parsed (->> (when (and args (not (clojure.string/blank? args)))
+                           (clojure.string/split args #","))
+                         (map clojure.string/trim)
+                         (remove clojure.string/blank?)
+                         (map #(render-template % ctx))
+                         (map (fn [s]
+                                (let [t (:osc-arg-type val "string")]
+                                  (case t
+                                    "int"   (try (int (Math/round (Double/parseDouble s))) (catch Throwable _ 0))
+                                    "float" (try (float (Double/parseDouble s)) (catch Throwable _ (float 0)))
+                                    s))))
+                         vec)]
+         (try
+           (timbre/debug "[OSC] enqueue" kind host port path parsed)
+           (blt-osc/route-send! kind host (int port) path parsed)
+           (catch Throwable t
+             (timbre/warn t "OSC enqueue failed" host port path))))))))
 
 (defn- missing-expression?
   "Checks whether the expression body of the specified kind is empty
@@ -1846,7 +1817,8 @@
      (.stop (org.deepsymmetry.beatlink.dbserver.ConnectionManager/getInstance))
      (.stop virtual-cdj)
      (Thread/sleep 200))  ; Wait for straggling update packets
-     (close-all-osc-clients)
+     (blt-osc/stop!)
+     (blt-osc/close-all-clients!)
    (reflect-online-state)
    (rebuild-all-device-status)))
 
