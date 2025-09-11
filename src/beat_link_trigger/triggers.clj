@@ -384,9 +384,9 @@
             (update-player-state trigger false false nil))
         (let [device-number (int (.number selection))
               found         (device-present? device-number)
-              sel-status    (when found (latest-status-for device-number))]
+              sel-status    (latest-status-for device-number)]
           (if found
-            (if (instance? CdjStatus sel-status)
+            (if (instance? org.deepsymmetry.beatlink.CdjStatus sel-status)
               (do (seesaw/config! status-label :foreground (:valid-status-color @theme-colors))
                   (seesaw/value! status-label (build-status-label sel-status track-description metadata-summary)))
               (do (seesaw/config! status-label :foreground "red")
@@ -718,20 +718,16 @@
        (let [tokens (template-tokens addr args)
              ctx    (osc-context status tokens)
              path   (render-template addr ctx)
-             parsed (->> (when (and args (not (clojure.string/blank? args)))
-                           (clojure.string/split args #","))
-                         (map clojure.string/trim)
-                         (remove clojure.string/blank?)
-                         (map #(render-template % ctx))
-                         (map (fn [s]
-                                (let [t (:osc-arg-type val "string")]
-                                  (case t
-                                    "int"   (try (int (Math/round (Double/parseDouble s))) (catch Throwable _ 0))
-                                    "float" (try (float (Double/parseDouble s)) (catch Throwable _ (float 0)))
-                                    s))))
-                         vec)]
+             parsed (let [raw (some-> args clojure.string/trim)]
+                      (if (or (nil? raw) (clojure.string/blank? raw))
+                        []
+                        (let [s (render-template raw ctx)
+                              t (:osc-arg-type val "string")] 
+                          [(case t
+                             "int"   (try (int (Math/round (Double/parseDouble s))) (catch Throwable _ 0))
+                             "float" (try (float (Double/parseDouble s)) (catch Throwable _ (float 0)))
+                             s)])))]
          (try
-           (timbre/debug "[OSC] enqueue" kind host port path parsed)
            (blt-osc/route-send! kind host (int port) path parsed)
            (catch Throwable t
              (timbre/warn t "OSC enqueue failed" host port path))))))))
@@ -1201,10 +1197,10 @@
         (doseq [trigger (get-triggers)]
           (let [selection (get-in @(seesaw/user-data trigger) [:value :players])]
             (when (instance? CdjStatus status)
-              (timbre/info "[Trigger] status" :device (.getDeviceNumber ^CdjStatus status)
-                           :playing (.isPlaying ^CdjStatus status)
-                           :selection selection
-                           :matches (matching-player-number? status trigger selection)))
+              (timbre/debug "[Trigger] status" :device (.getDeviceNumber ^CdjStatus status)
+                            :playing (.isPlaying ^CdjStatus status)
+                            :selection selection
+                            :matches (matching-player-number? status trigger selection)))
             (when (and (instance? CdjStatus status) (matching-player-number? status trigger selection))
               (let [^CdjStatus status status]
                 (when-not (neg? (:number selection))
@@ -1231,9 +1227,9 @@
           (let [data      @(seesaw/user-data trigger)
                 value     (:value data)
                 selection (:players value)]
-            (timbre/info "[Trigger] beat" :device (.getDeviceNumber beat)
-                         :selection selection
-                         :tracked (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))
+            (timbre/debug "[Trigger] beat" :device (.getDeviceNumber beat)
+                          :selection selection
+                          :tracked (= (get-in data [:last-match 1]) (.getDeviceNumber beat)))
             (when (and (some? selection)
                        (or (= (:number selection) (.getDeviceNumber beat))
                            (and (zero? (:number selection))

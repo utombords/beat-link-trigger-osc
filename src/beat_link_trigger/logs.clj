@@ -36,8 +36,12 @@
    (reify Thread$UncaughtExceptionHandler
      (uncaughtException [_ thread e]
        (timbre/error e "Uncaught exception on" (.getName thread)))))
-  (timbre/set-config!
-   {:min-level :info #_ [["taoensso.*" :error] ["*" :debug]]
+  (let [env-level (some-> (System/getenv "BLT_LOG_LEVEL") clojure.string/lower-case keyword)
+        level     (case env-level
+                    (:trace :debug :info :warn :error :fatal :report) env-level
+                    :info)]
+    (timbre/set-config!
+     {:min-level level #_ [["taoensso.*" :error] ["*" :debug]]
 
     ;; Control log filtering by namespaces/patterns. Useful for turning off
     ;; logging in noisy libraries, etc.:
@@ -51,7 +55,7 @@
 
     :output-fn   timbre/default-output-fn ; (fn [data]) -> string
     :output-opts {:stacktrace-fonts {}}
-    })
+    }))
 
   ;; Install the desired log appenders
   (let [max-size 200000
